@@ -1,0 +1,704 @@
+---
+title: "White-tailed deer occupancy modeling"
+author: "Marie V. Lilly"
+date: "12/19/2024"
+output: pdf_document
+fontsize: 12pt
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Knit option to cut long lines of code
+require('formatR')
+knitr::opts_chunk$set(tidy.opts = list(width.cutoff = 50), tidy = TRUE)
+```
+
+## R Markdown
+
+```{r}
+#Summarizes daily occupancy report downloaded from the UWIN Database into 7 day (presence/absence) sampling occasions. 
+
+#Download a multi-season occupancy report from the UWIN website so you can run the code on all your data at once. Make sure you filter for the actual species your interested in
+
+#Code provided by Mason Fidino from UWIN Chicago Team. I can forward the email as well but I just copy and pasted the code here. 
+
+#Read in the UWIN data
+setwd("/users/marielilly/Desktop/R/UWIN_MH/Ch1_Manuscript_Code")
+full_history <- read.csv("WTD_Occurance.csv")
+
+#Get all columns that start with day
+day_cols <- full_history[,grep("^Day_",colnames(full_history))]
+
+# split them into seven day groups
+n_weeks <- ceiling(ncol(day_cols)/7)
+week_groups <- rep(1:n_weeks, each = 7)[1:ncol(day_cols)]
+
+    combine_days <- function(y, groups){
+      ans <- rep(NA, max(groups))
+      for(i in 1:length(groups)){
+        tmp <- as.numeric(y[groups == i])
+        if(all(is.na(tmp))){
+          next
+        } else {
+          ans[i] <- as.numeric(sum(tmp, na.rm = TRUE)>0)
+        }
+      }
+      return(ans)
+    }
+   
+week_summary <- t(
+  apply(
+        day_cols,
+        1,
+        combine_days,
+        groups = week_groups
+        )
+   )
+
+    colnames(week_summary) <- paste0("Week_",1:n_weeks)
+    full_history <- full_history[,-grep("^Day_", colnames(full_history))]
+    full_history <- cbind(full_history, week_summary)
+    
+```
+
+```{r}
+#Packages you'll need and this code chunk filters for specific species, removes rows (Season x Site) were the cameras were not out for 4 weeks. 
+
+library(MuMIn)
+library('data.table')
+library(dplyr)
+library(stringr)
+library(magrittr) # for piping
+library(ggplot2) # for plotting
+library(unmarked) # for occupancy models
+library(AICcmodavg) # For GOF tests
+
+
+# target species will be analyzed separately and removing observations where cameras were not put out
+# Run analysis for the specific species of interest
+ DFDeer <- full_history %>%
+   filter(Species == "White-tailed deer") 
+
+#create row for # of site visits
+DFDeer$effort <- 9 - rowSums(is.na(DFDeer[,6:14]))
+
+#remove camera sites with less than 4 visits
+DFDeer <- DFDeer %>%
+   filter(effort >= 4)
+
+# Creating columns for year and season
+
+DFDeer$year <- ifelse(DFDeer$Season == 1 , "2022",
+                                    ifelse(DFDeer$Season == 2, "2022",
+                                    ifelse(DFDeer$Season == 3, "2022", "2023")))
+
+DFDeer$season <- ifelse(DFDeer$Season == 1 , "Spring",
+                                    ifelse(DFDeer$Season == 2, "Summer",
+                                    ifelse(DFDeer$Season == 3, "Fall",
+                                    ifelse(DFDeer$Season == 4, "Winter",
+                                           FALSE))))
+
+
+
+#Since the report I uploaded includes more that 4 weeks per season (cameras are not all out on the same exact dates), the following code trims the remaining rows so that 4 weeks of data for each season are all lined up and there are no NA's in the occupancy matrix just 1's and 0's
+
+#DF of detections
+t <- DFDeer[,6:14]
+
+# #create new df with first 4 secondary sampling occasions
+detection_history <- data.frame(matrix(ncol =4, nrow = 0))
+for (i in 1:139) {
+   l <- t[i,]
+   detection_history[i,] <- tail(l[!is.na(l)],4)
+ }
+
+
+DFDeer <- cbind(DFDeer[,c(3,15,16,17)], detection_history)
+
+
+
+```
+
+```{r}
+#site level covariates for model this needs to have the same amount of rows as your detection history matrix, make sure your site covariates are organized so that the site row order matches your detection history also
+
+site_cov <- read.csv("UWIN_Covariates_df.csv")
+
+#cleanup scovariates to remove column with names and to remove empty rows at bottom
+site_cov <- subset(site_cov, select = -c(Loc_Nm) )
+#cleanup scovariates to remove column with names and to remove empty rows at bottom
+site_cov <- site_cov[-c(46:48),]
+site_cov <- site_cov[-c(12),]
+
+##remove safegraph data column because missing too much data...
+site_cov <- subset(site_cov, select = -c(Human_Visitation_SG) )
+
+Season <- read.csv("Seasonal.csv")
+Season <- Season[-c(45),]
+
+colnames(site_cov)
+
+#check correlation between some coves
+library(corrplot)
+cor.test.df <-site_cov %>% select(Connect300v1_ParkBuffer1000, Prop_Water_ParkBuffer100, Road_Density_km_ParkBuffer500, PCT_Human_CameraDays, PCT_TCC_PARK_BUFFER1000, PCT_Impervious_Park1000, HU_Density_Km_Park1000)
+
+cor.test.df <-site_cov %>% dplyr::select(Connect300v1_ParkBuffer1000, Prop_Water_ParkBuffer100, Road_Density_km_ParkBuffer500, PCT_Human_CameraDays, PCT_TCC_PARK_BUFFER1000, PCT_Impervious_Park1000, HU_Density_Km_Park1000, PARK_AREA_m)
+
+corrplot(cor(cor.test.df), method = 'number')
+
+```
+
+```{r}
+#Code to reformat the new occupancy matrix. This code will put all seasons of data for a site in the same row. Edit this code so that it is labeling your seasons chronologically. I started with spring for my analysis and ended Winter 2023
+
+DFDeerS <- DFDeer %>% 
+  filter(season == "Spring") %>% 
+  subset(select = -c(year,season, effort))
+
+DFDeerSu <- DFDeer %>% 
+  filter(season == "Summer") %>% 
+  subset(select = -c(year,season, effort)) %>% 
+    setnames(old = c("X1","X2","X3","X4"), 
+         new = c("X5","X6","X7","X8"))
+
+DFDeerF <- DFDeer %>% 
+   filter(season == "Fall") %>% 
+   subset(select = -c(year,season, effort)) %>% 
+     setnames(old = c("X1","X2","X3","X4"), 
+          new = c("X9","X10","X11","X12"))  
+
+ DFDeerW <- DFDeer %>% 
+   filter(season == "Winter") %>% 
+   subset(select = -c(year,season, effort)) %>% 
+     setnames(old = c("X1","X2","X3","X4"), 
+          new = c("X13","X14","X15","X16"))
+
+
+#Merging the seasons chronologically with the new week numbers (X1 - X12)
+DFDeerFull <- merge(merge(merge(x= merge(x = DFDeerS, y = DFDeerSu, by = "Site",
+                                   all = TRUE), y = DFDeerF, by= "Site", all = TRUE), y = DFDeerW, by = "Site", all=TRUE), y= site_cov, by= "Site", all = TRUE)
+
+
+
+# Final detection history occupancy matrix formatted for modelling
+detection.history <- DFDeerFull %>% 
+  dplyr::select(2:17)
+
+#Cleanup covariates
+
+
+#scale covariates for analysis
+#site_covz <- data.frame(Site = site_cov[,1], scale(site_cov[,2:26]))
+
+#without scaling for making figure later
+site_covz <- data.frame(Site = site_cov[,1], (site_cov[,2:26]))
+
+
+```
+
+
+```{r}
+#Occupancy model codes here this is all done with the unmarked package (see documentation)
+#these three pages really are great for understanding how to use the code. The first link is a great overview. The second link is where I got my model goodness of fit test
+
+# https://jamesepaterson.github.io/jamespatersonblog/2020-09-01_occupancyintroduction.html
+# https://doi90.github.io/lodestar/fitting-occupancy-models-with-unmarked.html#model-selection
+# https://darinjmcneil.weebly.com/single-season-occupancy.html
+
+#fitting data and covariates to be used in models
+sample.unmarkedFrame_cov <- unmarkedFrameOccu( # y is a matrix with observed detection history 
+                                          # (0's and 1's, one row per site, one column per survey)
+                                      y = as.matrix(detection.history),
+                                      obsCovs= list(Season=Season),
+                                      # # obsCovs = observation covariates in a list, 
+                                      # # each variable has site rows x survey columns
+                                      siteCovs = site_covz[,c(2:26)]) 
+
+# Summary of the detection history for your models
+summary(sample.unmarkedFrame_cov)
+
+##Model selection process
+#Selection for best supported detection Probability covariates
+# detection probability models to be tested
+fm <- occu(formula = ~1 ~1, 
+                data = sample.unmarkedFrame_cov, starts=c(0,0))
+fm1 <- occu(formula = ~PCT_TCC_CameraBuffer100 ~ 1, 
+                 data = sample.unmarkedFrame_cov, starts=c(1,1,0))
+fm2 <- occu(formula = ~Season ~ 1, 
+                data = sample.unmarkedFrame_cov, starts=c(1,1,0,0,0))
+fm3 <- occu(formula = ~PCT_TCC_CameraBuffer100 + Season ~ 1, 
+                 data = sample.unmarkedFrame_cov, starts=c(1,1,0,0,0,0))
+
+#fitting detection models for a selection fit list
+fit <- fitList(#'psi(.)p(.)' = fm,
+               'psi(.)p(Tree)' = fm1,
+               #'psi(.)p(Season)' = fm2,
+               'psi(.)p(Tree + Season)' = fm3)
+fit2 <- fitList('psi(.)p(.)' = fm,
+               #'psi(.)p(Tree)' = fm1,
+               'psi(.)p(Season)' = fm2)
+               #'psi(.)p(Tree + Season)' = fm3)
+
+# code to run selection fit list
+modSel(fit)
+modSel(fit2)
+```
+
+
+```{r}
+#Selection for best supported occupancy covariates, the best supported detection covariates are used in all these models
+
+#occupancy models to be tested
+
+#null model
+fm <- occu(formula = ~PCT_TCC_CameraBuffer100 + Season ~ 1, 
+                 data = sample.unmarkedFrame_cov, starts=c(1,1,0,0,0,0))
+
+###Assessing connectivity model radius and buffer size
+# Compare buffer sizes
+fm1 <- occu(formula = ~PCT_TCC_CameraBuffer100 + Season ~ Connect500_ParkBuffer1000, 
+                 data = sample.unmarkedFrame_cov, starts=c(1,0,1,0,0,0,0))
+fm2 <- occu(formula = ~PCT_TCC_CameraBuffer100 + Season ~ Connect500_ParkBuffer500, 
+                 data = sample.unmarkedFrame_cov, starts=c(1,0,1,0,0,0,0))
+fm3 <- occu(formula = ~PCT_TCC_CameraBuffer100 + Season ~ Connect500_ParkBuffer100, 
+                 data = sample.unmarkedFrame_cov, starts=c(1,0,1,0,0,0,0))
+
+fit <- fitList('psi(.)p(Tree + Season)' = fm,
+               'psi(Connect500_Buffer1000)p(Tree + Season)' = fm1,
+               'psi(Connect500_Buffer500)p(Tree + Season)' = fm2,
+               'psi(Connect500_Buffer100)p(Tree + Season)' = fm3)
+
+modSel(fit)
+
+#100m buffer is best
+
+##Now looking at the different connectivity model radii result comparisons all at 1000m buffer
+fm4 <- occu(formula = ~PCT_TCC_CameraBuffer100 + Season ~ Connect500v1_ParkBuffer1000, 
+                 data = sample.unmarkedFrame_cov, starts=c(1,0,1,0,0,0,0))
+fm5 <- occu(formula = ~PCT_TCC_CameraBuffer100 + Season ~ Connect400_ParkBuffer1000, 
+                 data = sample.unmarkedFrame_cov, starts=c(1,0,1,0,0,0,0))
+fm6 <- occu(formula = ~PCT_TCC_CameraBuffer100 + Season ~ Connect400v1_ParkBuffer1000, 
+                 data = sample.unmarkedFrame_cov, starts=c(1,0,1,0,0,0,0))
+fm7<- occu(formula = ~PCT_TCC_CameraBuffer100 + Season ~ Connect300_ParkBuffer1000, 
+                 data = sample.unmarkedFrame_cov, starts=c(1,0,1,0,0,0,0))
+fm8<- occu(formula = ~PCT_TCC_CameraBuffer100 + Season ~ Connect300v1_ParkBuffer1000, 
+                 data = sample.unmarkedFrame_cov, starts=c(1,0,1,0,0,0,0))
+fm9<- occu(formula = ~PCT_TCC_CameraBuffer100 + Season ~ Connect200_ParkBuffer1000, 
+                 data = sample.unmarkedFrame_cov, starts=c(1,0,1,0,0,0,0))
+fm10<- occu(formula = ~PCT_TCC_CameraBuffer100 + Season ~ Connect200v1_ParkBuffer1000, 
+                 data = sample.unmarkedFrame_cov, starts=c(1,0,1,0,0,0,0))
+fm11<- occu(formula = ~PCT_TCC_CameraBuffer100 + Season ~ Connect100_ParkBuffer1000, 
+                 data = sample.unmarkedFrame_cov, starts=c(1,0,1,0,0,0,0))
+fm12<- occu(formula = ~PCT_TCC_CameraBuffer100 + Season ~ Connect100v1_ParkBuffer1000, 
+                 data = sample.unmarkedFrame_cov, starts=c(1,0,1,0,0,0,0))
+
+fit <- fitList('psi(.)p(Tree + Season)' = fm,
+               'psi(Connect500_Buffer1000)p(Tree + Season)' = fm1,
+               'psi(Connect500v1_Buffer1000)p(Tree + Season)' = fm4,
+               'psi(Connect400_Buffer1000)p(Tree + Season)' = fm5,
+               'psi(Connect400v1_Buffer1000)p(Tree + Season)' = fm6,
+               'psi(Connect300_Buffer1000)p(Tree + Season)' = fm7,
+               'psi(Connect300v1_Buffer1000)p(Tree + Season)' = fm8,
+               'psi(Connect200_Buffer1000)p(Tree + Season)' = fm9,
+               'psi(Connect200v1_Buffer1000)p(Tree + Season)' = fm10,
+               'psi(Connect100_Buffer1000)p(Tree + Season)' = fm11,
+               'psi(Connect100v1_Buffer1000)p(Tree + Season)' = fm12)
+
+modSel(fit)
+#Connectivity model version 1 with radii 300 is best fit
+
+#Compare buffer sizes of all other covariates
+#Road density
+Road1000 <- occu(formula = ~PCT_TCC_CameraBuffer100 + Season ~ Road_Density_km_ParkBuffer1000, 
+                 data = sample.unmarkedFrame_cov, starts=c(1,0,1,0,0,0,0))
+Road500 <- occu(formula = ~PCT_TCC_CameraBuffer100 + Season ~ Road_Density_km_ParkBuffer500, 
+                 data = sample.unmarkedFrame_cov, starts=c(1,0,1,0,0,0,0))
+Road100 <- occu(formula = ~PCT_TCC_CameraBuffer100 + Season ~ Road_Density_km_ParkBuffer100, 
+                 data = sample.unmarkedFrame_cov, starts=c(1,0,1,0,0,0,0))
+
+fit_road <- fitList('psi(.)p(Tree + Season)' = fm,
+               'psi(Road1000)p(Tree + Season)' = Road1000,
+               'psi(Road500)p(Tree + Season)' = Road500,
+               'psi(Road100)p(Tree + Season)' = Road100)
+
+modSel(fit_road)
+###500m Buffer lower AIC for roads
+
+
+#HU density
+HU1000 <- occu(formula = ~PCT_TCC_CameraBuffer100 + Season ~ HU_Density_Km_Park1000, 
+                 data = sample.unmarkedFrame_cov, starts=c(1,0,1,0,0,0,0))
+HU500 <- occu(formula = ~PCT_TCC_CameraBuffer100 + Season ~ HU_Density_Km_Park500, 
+                 data = sample.unmarkedFrame_cov, starts=c(1,0,1,0,0,0,0))
+HU100 <- occu(formula = ~PCT_TCC_CameraBuffer100 + Season ~ HU_Density_Km_Park100, 
+                 data = sample.unmarkedFrame_cov, starts=c(1,0,1,0,0,0,0))
+
+fit_HU <- fitList('psi(.)p(Tree + Season)' = fm,
+               'psi(HU1000)p(Tree + Season)' = HU1000,
+               'psi(HU500)p(Tree + Season)' = HU500,
+               'psi(HU100)p(Tree + Season)' = HU100)
+
+modSel(fit_HU)
+
+##Housing density 1000 m buffer is best
+
+
+#Prop Water
+Water1000 <- occu(formula = ~PCT_TCC_CameraBuffer100 + Season ~ Prop_Water_ParkBuffer1000, 
+                 data = sample.unmarkedFrame_cov, starts=c(1,0,1,0,0,0,0))
+Water500 <- occu(formula = ~PCT_TCC_CameraBuffer100 + Season ~ Prop_Water_ParkBuffer500, 
+                 data = sample.unmarkedFrame_cov, starts=c(1,0,1,0,0,0,0))
+Water100 <- occu(formula = ~PCT_TCC_CameraBuffer100 + Season ~ Prop_Water_ParkBuffer100, 
+                 data = sample.unmarkedFrame_cov, starts=c(1,0,1,0,0,0,0))
+
+fit_water <- fitList('psi(.)p(Tree + Season)' = fm,
+               'psi(Water1000)p(Tree + Season)' = Water1000,
+               'psi(Water500)p(Tree + Season)' = Water500,
+               'psi(Water100)p(Tree + Season)' = Water100)
+
+modSel(fit_water)
+summary(Water100)
+##Water 100m buffer best fit, but not significant
+
+
+#Impervious
+I1000 <- occu(formula = ~PCT_TCC_CameraBuffer100 + Season ~ PCT_Impervious_Park1000, 
+                 data = sample.unmarkedFrame_cov, starts=c(1,0,1,0,0,0,0))
+I500 <- occu(formula = ~PCT_TCC_CameraBuffer100 + Season ~ PCT_Impervious_Park500, 
+                 data = sample.unmarkedFrame_cov, starts=c(1,0,1,0,0,0,0))
+I100 <- occu(formula = ~PCT_TCC_CameraBuffer100 + Season ~ PCT_Impervious_Park100, 
+                 data = sample.unmarkedFrame_cov, starts=c(1,0,1,0,0,0,0))
+
+fit_I <- fitList('psi(.)p(Tree + Season)' = fm,
+               'psi(I1000)p(Tree + Season)' = I1000,
+               'psi(I500)p(Tree + Season)' = I500,
+               'psi(I100)p(Tree + Season)' = I100)
+
+modSel(fit_I)
+#Impervious 1000m buffer best fit
+
+
+#TCC
+TCC1000 <- occu(formula = ~PCT_TCC_CameraBuffer100 + Season ~ PCT_TCC_PARK_BUFFER1000, 
+                 data = sample.unmarkedFrame_cov, starts=c(1,0,1,0,0,0,0))
+TCC500 <- occu(formula = ~PCT_TCC_CameraBuffer100 + Season ~ PCT_TCC_PARK_BUFFER500, 
+                 data = sample.unmarkedFrame_cov, starts=c(1,0,1,0,0,0,0))
+TCC100 <- occu(formula = ~PCT_TCC_CameraBuffer100 + Season ~ PCT_TCC_PARK_BUFFER100, 
+                 data = sample.unmarkedFrame_cov, starts=c(1,0,1,0,0,0,0))
+
+fit_TCC <- fitList('psi(.)p(Tree + Season)' = fm,
+               'psi(TCC1000)p(Tree + Season)' = TCC1000,
+               'psi(TCC500)p(Tree + Season)' = TCC500,
+               'psi(TCC100)p(Tree + Season)' = TCC100)
+
+modSel(fit_TCC)
+#1000m buffer best fit!
+
+
+```
+```{r}
+#Using the "Dredge function" to test every combination of model variables from global model
+###Global model still cannot include variables too highly correlated, so trying with connectivity, then HU, then impervious, then TCC
+
+fm_full_connect <- occu(formula = ~ PCT_TCC_CameraBuffer100 + Season ~ Connect300v1_ParkBuffer1000 + Prop_Water_ParkBuffer100 + Road_Density_km_ParkBuffer500 + PCT_Human_CameraDays, 
+                data = sample.unmarkedFrame_cov)
+dredge(fm_full_connect)
+#top performing only has detection covariates and Connect500 aic = 339.9, connect300v1 AIC = 338.9
+#followed by: connect + water, connect + roads, connect + human camera, connect + human + water, connect + water + roads, connect human, roads, connect human water, connect human water roads --> turns out roads and connectivity too highly correlated to be in same model, same with roads and several other landscape metrics
+
+fm_full_hu <- occu(formula = ~ PCT_TCC_CameraBuffer100 + Season ~ HU_Density_Km_Park1000 + Prop_Water_ParkBuffer100 + Road_Density_km_ParkBuffer500 + PCT_Human_CameraDays, 
+                data = sample.unmarkedFrame_cov)
+dredge(fm_full_hu)
+#detection + road density has lowest aic = 346.4
+
+fm_full_imp <- occu(formula = ~ PCT_TCC_CameraBuffer100 + Season ~  PCT_Impervious_Park1000 + Prop_Water_ParkBuffer100 + Road_Density_km_ParkBuffer500 + PCT_Human_CameraDays, 
+                data = sample.unmarkedFrame_cov)
+dredge(fm_full_imp)
+#top performing has detection and impervious surface alone, followed by detection and road density, followed by detection, imp + road density. higher AIC than connectivity though
+#AIC 346.2, 346.4, 346.7
+
+fm_full_TCC <- occu(formula = ~ PCT_TCC_CameraBuffer100 + Season ~ PCT_TCC_PARK_BUFFER1000 + Prop_Water_ParkBuffer100 + Road_Density_km_ParkBuffer500 + PCT_Human_CameraDays, 
+                data = sample.unmarkedFrame_cov)
+dredge(fm_full_TCC)
+#top performing is detection and TCC + road --> most similar to connectivity hmmm,  higher aic than connectivity though, followed by TCC alone
+#AIC = 345.4
+
+##TOP performing models for making a model list
+fm_connect <- occu(formula = ~ PCT_TCC_CameraBuffer100 + Season ~ Connect300v1_ParkBuffer1000, 
+                data = sample.unmarkedFrame_cov, starts=c(1,0,1,0,0,0,0))
+
+fm_connect_water <- occu(formula = ~ PCT_TCC_CameraBuffer100 + Season ~ Connect300v1_ParkBuffer1000 + Prop_Water_ParkBuffer100, 
+                data = sample.unmarkedFrame_cov, starts=c(1,0,1,0,0,0,0,0))
+
+fm_connect_human <- occu(formula = ~ PCT_TCC_CameraBuffer100 + Season ~ Connect300v1_ParkBuffer1000 + PCT_Human_CameraDays, 
+                data = sample.unmarkedFrame_cov, starts=c(1,0,1,0,0,0,0,0))
+
+fm_connect_water_human <- occu(formula = ~ PCT_TCC_CameraBuffer100 + Season ~ Connect300v1_ParkBuffer1000 + Prop_Water_ParkBuffer100 + PCT_Human_CameraDays, 
+                data = sample.unmarkedFrame_cov, starts=c(1,0,1,0,0,0,0,0,0))
+
+fm_impervious <- occu(formula = ~ PCT_TCC_CameraBuffer100 + Season ~  PCT_Impervious_Park1000, 
+                data = sample.unmarkedFrame_cov, starts=c(1,0,1,0,0,0,0))
+
+fm_road <- occu(formula = ~ PCT_TCC_CameraBuffer100 + Season ~ Road_Density_km_ParkBuffer500, 
+                data = sample.unmarkedFrame_cov, starts=c(1,0,1,0,0,0,0))
+
+fm_TCC <- occu(formula = ~ PCT_TCC_CameraBuffer100 + Season ~ PCT_TCC_PARK_BUFFER1000, 
+                data = sample.unmarkedFrame_cov, starts=c(1,0,1,0,0,0,0))
+
+fit_selected <- fitList(fm_connect, 
+                        fm_connect_water,
+                        fm_connect_human,
+                        fm_connect_water_human,
+                        fm_impervious,
+                        fm_TCC)
+
+modSel(fit_selected)
+summary(fm_connect_water_human)
+summary(fm_connect) #strongest effect
+summary(fm_connect_water)
+summary(fm_TCC)
+summary(fm_impervious)
+
+```
+
+```{r}
+##Model averaging
+# Make model list for model averaging
+
+occu_model_list <- list(occ_connect = fm_connect,
+                        occ_connect2  = fm_connect_water,
+                        occ_connect3 = fm_connect_human,
+                        occ_connect4 = fm_connect_water_human,
+                        occ_imp = fm_impervious,
+                        occ_tcc = fm_TCC,
+                        occ_road = fm_road)
+
+
+occu_model_list_reduced <- list(occ_connect = fm_connect,
+                        occ_connect2 = fm_connect_water,
+                        occ_imp = fm_impervious,
+                        occ_tcc = fm_TCC,
+                        occ_road = fm_road)
+
+
+## ----modelaveragedpredictions----------
+# With lots of models, it will be slow
+library(AICcmodavg)
+occu_modavg_psi_predict <- modavgPred(occu_model_list, 
+                                        # c.hat = 1, # to change variance inflation factor, default = 1) 
+                                        parm.type = "psi", # psi = occupancy, can also be "detect" for detection probability
+                                        newdata = sample.unmarkedFrame_cov@siteCovs)[c("mod.avg.pred",
+                                                                                       "lower.CL",
+                                                                                       "upper.CL")]
+
+## Put predictions, CI, and all site covariates into one data frame
+occu_modavg_psi_predict_df <- data.frame(Predicted = occu_modavg_psi_predict$mod.avg.pred,
+                                    lower = occu_modavg_psi_predict$lower.CL,
+                                    upper = occu_modavg_psi_predict$upper.CL,
+                                    site_covz)
+
+# Look at first values
+head(occu_modavg_psi_predict_df)
+
+##Predict with reduced list...
+occu_modavg_psi_predict2 <- modavgPred(occu_model_list_reduced, 
+                                        # c.hat = 1, # to change variance inflation factor, default = 1) 
+                                        parm.type = "psi", # psi = occupancy, can also be "detect" for detection probability
+                                        newdata = sample.unmarkedFrame_cov@siteCovs)[c("mod.avg.pred",
+                                                                                       "lower.CL",
+                                                                                       "upper.CL")]
+
+## Put predictions, CI, and all site covariates into one data frame
+occu_modavg_psi_predict_df2 <- data.frame(Predicted = occu_modavg_psi_predict2$mod.avg.pred,
+                                    lower = occu_modavg_psi_predict2$lower.CL,
+                                    upper = occu_modavg_psi_predict2$upper.CL,
+                                    site_covz)
+
+# Look at first values
+head(occu_modavg_psi_predict_df2)
+
+
+###model predictions from top model only, not model averaging
+# Predict effect on new data set to see how occupancy changes with connectivity alone
+predict_fm_connect <- cbind(predict(fm_connect,
+                             newdata = sample.unmarkedFrame_cov@siteCovs,  type = "state")[c("Predicted",
+                                                                                       "lower",
+                                                                                       "upper")])
+
+#data.frame(Connect300v1_ParkBuffer1000 =
+                                                    #seq(min(site_covz$Connect300v1_ParkBuffer1000), max(site_covz$Connect300v1_ParkBuffer1000), by = 0.01)), type="state"))
+
+## Put predictions, CI, and all site covariates into one data frame
+fm_connect_predict_df <- data.frame(Predicted = predict_fm_connect$Predicted,
+                                    lower = predict_fm_connect$lower,
+                                    upper = predict_fm_connect$upper,
+                                    site_covz)
+
+# Look at first values
+head(fm_connect_predict_df)
+write.csv(fm_connect_predict_df, "connectivity_model_occupancy.csv")
+write.csv(occu_modavg_psi_predict_df, "modelaverage_occupancy.csv")
+write.csv(occu_modavg_psi_predict_df2, "modelaverage_reduced_occupancy.csv")
+
+
+
+```
+
+```{r}
+## ----modelaveragedpredictions----------
+# Predict for unsampled sites
+library(AICcmodavg)
+tick_sites <- read.csv("Tick_predictors.csv")
+#cleanup
+tick_sites <- subset(tick_sites, select = -c(Predicted_ModelAverage, Predicted_Connectivity) )
+
+site_covz2 <- data.frame(Site = tick_sites[,1], scale(tick_sites[,2:15]))
+
+occu_modavg_psi_predict_newsites <- modavgPred(occu_model_list_reduced, 
+                                        # c.hat = 1, # to change variance inflation factor, default = 1) 
+                                        parm.type = "psi", # psi = occupancy, can also be "detect" for detection probability
+                                        newdata = site_covz2)[c("mod.avg.pred",
+                                                                                       "lower.CL",
+                                                                                       "upper.CL")]
+
+## Put predictions, CI, and all site covariates into one data frame
+occu_modavg_psi_predict_newsites_df <- data.frame(Predicted = occu_modavg_psi_predict_newsites$mod.avg.pred,
+                                    lower = occu_modavg_psi_predict_newsites$lower.CL,
+                                    upper = occu_modavg_psi_predict_newsites$upper.CL,
+                                    site_covz2)
+
+# Look at first values
+head(occu_modavg_psi_predict_newsites_df)
+write.csv(occu_modavg_psi_predict_newsites_df, "tick_sites_modavg_predoccupancy.csv")
+
+
+# Predict effect on new data set to see how occupancy changes with connectivity alone
+predict_fm_connect_NEW <- cbind(predict(fm_connect,
+                             newdata = site_covz2,  type = "state")[c("Predicted",
+                                                                                       "lower",
+                                                                                       "upper")])
+
+#data.frame(Connect300v1_ParkBuffer1000 =
+                                                    #seq(min(site_covz$Connect300v1_ParkBuffer1000), max(site_covz$Connect300v1_ParkBuffer1000), by = 0.01)), type="state"))
+
+## Put predictions, CI, and all site covariates into one data frame
+fm_connect_predict_new_df <- data.frame(Predicted = predict_fm_connect_NEW$Predicted,
+                                    lower = predict_fm_connect_NEW$lower,
+                                    upper = predict_fm_connect_NEW$upper,
+                                    site_covz2)
+
+# Look at first values
+head(fm_connect_predict_new_df)
+write.csv(fm_connect_predict_new_df, "tick_sites_connect_mod_predoccupancy.csv")
+
+
+```
+
+
+```{r}
+#Evaluating null model to see if my species specific detection matrix has sufficient data for occupancy models, details for this in the link
+# https://doi90.github.io/lodestar/fitting-occupancy-models-with-unmarked.html#model-selection
+
+confint(fm, type= 'state')
+fitstats <- function(fm, method = "nonparboot") {
+    observed <- getY(fm@data)
+    expected <- fitted(fm)
+    resids <- residuals(fm, method = "nonparboot")
+    sse <- sum(resids^2, na.rm = TRUE)
+    chisq <- sum((observed - expected)^2 / expected, na.rm = TRUE)
+    freeTuke <- sum((sqrt(observed) - sqrt(expected))^2, na.rm = TRUE)
+    out <- c(SSE=sse, Chisq=chisq, freemanTukey=freeTuke)
+    return(out)
+}
+
+pb <- parboot(fm,
+               fitstats,
+               nsim = 25,
+               report = TRUE,
+               method = "nonparboot")
+
+pb
+
+###Each test should be >>>.05 to show that there is enough data
+
+```
+```{r}
+# Do Mackenzie-Bailey goodness of fit test for single-season occupancy model
+m2_mb.gof.boot <- mb.gof.test(fm1,
+                                # Demonstrate with small number of sims (10), 
+                                # but then change to large number (e.g. 1000)
+                                nsim = 500)
+
+# View Results
+m2_mb.gof.boot
+#"Estimate of c-hat = 0.51" which should indicate that the model fit is good (not overdispersed because <1, and not a poor fit becuase not <<<1)
+```
+
+```{r}
+#visualizing occupancy with best predictors
+
+#Rerun occupancy code without scaling covariates for making figures.
+library(ggeffects)
+##Connectivity occupancy relationship
+newdata <- data.frame(Connect300v1_ParkBuffer1000 = seq(min(site_covz$Connect300v1_ParkBuffer1000), 
+                                                      max(site_covz$Connect300v1_ParkBuffer1000), by = 0.1))
+
+pred.psi <- cbind(predict(fm_connect, newdata = newdata, type="state", max=1), 
+                  data.frame(Connect300v1_ParkBuffer1000 = seq(min(site_covz$Connect300v1_ParkBuffer1000), 
+                                                             max(site_covz$Connect300v1_ParkBuffer1000), by = 0.1)))
+
+# Plot relationship with connectivity
+ggplot(data = pred.psi, aes(x = Connect300v1_ParkBuffer1000, y = Predicted)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), fill = "gold") +
+  geom_line( color="darkgoldenrod", size=1, alpha=0.9, linetype=1) +
+  theme_classic() +
+  ylim(0, 1)+
+  theme(axis.title = element_text(family='', size = 24)) +
+  theme(axis.text.y = element_text(size = 18), axis.text.x = element_text(size=18)) +
+  labs(x = "Functional Connectivity", y = "White-tailed Deer Occupancy")
+
+
+##Impervious occupancy relationship
+newdata <- data.frame(PCT_Impervious_Park1000 = seq(min(site_covz$PCT_Impervious_Park1000), 
+                                                        max(site_covz$PCT_Impervious_Park1000), by = 0.1))
+
+pred.psi <- cbind(predict(fm_impervious, newdata = newdata, type="state", max=1), 
+                  data.frame(PCT_Impervious_Park1000 = seq(min(site_covz$PCT_Impervious_Park1000), 
+                                                               max(site_covz$PCT_Impervious_Park1000), by = 0.1)))
+
+# Plot relationship with occupancy and impervious surface
+ggplot(data = pred.psi, aes(x = PCT_Impervious_Park1000, y = Predicted)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), fill = "violet") +
+  geom_line( color="magenta4", size=1, alpha=0.9, linetype=1) +
+  theme_classic() +
+  #stat_smooth(method = "auto", col = "darkgoldenrod", se = FALSE) +
+  ylim(0, 1)+
+  theme(axis.title = element_text(family='', size = 24)) +
+  theme(axis.text.y = element_text(size = 18), axis.text.x = element_text(size=18)) +
+  labs(x = "Percent impervious surface", y = "White-tailed Deer Occupancy")
+
+
+##TCC occupancy relationship
+newdata <- data.frame(PCT_TCC_PARK_BUFFER1000 = seq(min(site_covz$PCT_TCC_PARK_BUFFER1000), 
+                                                    max(site_covz$PCT_TCC_PARK_BUFFER1000), by = 0.1))
+
+pred.psi <- cbind(predict(fm_TCC, newdata = newdata, type="state", max=1), 
+                  data.frame(PCT_TCC_PARK_BUFFER1000 = seq(min(site_covz$PCT_TCC_PARK_BUFFER1000), 
+                                                           max(site_covz$PCT_TCC_PARK_BUFFER1000), by = 0.1)))
+
+## ----plotrelationships----
+library(ggplot2)
+# Plot relationship with connectivity
+ggplot(data = pred.psi, aes(x = PCT_TCC_PARK_BUFFER1000, y = Predicted)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), fill = "palegreen") +
+  geom_line( color="darkgreen", size=1, alpha=0.9, linetype=1) +
+  theme_classic() +
+  #stat_smooth(method = "auto", col = "darkgoldenrod", se = FALSE) +
+  ylim(0, 1)+
+  theme(axis.title = element_text(family='', size = 24)) +
+  theme(axis.text.y = element_text(size = 18), axis.text.x = element_text(size=18)) +
+  labs(x = "Percent tree canopy cover", y = "White-tailed Deer Occupancy")
+
+
+```
